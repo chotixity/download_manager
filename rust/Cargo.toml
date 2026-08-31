@@ -8,6 +8,11 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 flutter_rust_bridge = "=2.13.0"
+reqwest = {version = "0.13.4", default-features = false, features = ["stream", "rustls"] }
+tokio = { version = "1", features = ["fs", "io-util", "sync", "rt-multi-thread", "macros"] }
+futures-util = "0.3"
+thiserror = "1"
+
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
