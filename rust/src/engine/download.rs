@@ -14,6 +14,7 @@ const PROGRESS_BYTE_STEP: u64 = 64 * 1024; // report at most every 64 KiB per se
 
 #[derive(Debug, Clone)]
 pub enum ProgressEvent {
+    Started { total_bytes: Option<u64>, num_segments: u64 },
     SegmentProgress { index: usize, bytes_downloaded: u64 },
     SegmentDone { index: usize },
     Merged { total_bytes: u64 },
@@ -43,7 +44,11 @@ pub async fn probe(client: &reqwest::Client, url: &str) -> Result<(Option<u64>, 
     if !resp.status().is_success() {
         return Err(EngineError::BadStatus(resp.status().as_u16()));
     }
-    let len = resp.content_length();
+    let len = resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
     let accepts_ranges = resp
         .headers()
         .get(reqwest::header::ACCEPT_RANGES)
@@ -56,14 +61,19 @@ pub async fn probe(client: &reqwest::Client, url: &str) -> Result<(Option<u64>, 
 /// Downloads one byte range (or, if `range` is `None`, the whole resource) to its
 /// own temp file. Each segment gets its own `File` handle so segments never
 /// contend on a shared file position - the tradeoff is a merge step at the end.
+///
+/// `expected_len` is how many bytes this segment must produce: the range length
+/// for a ranged segment, or the resource's `Content-Length` for the unranged
+/// fallback. `None` only when the server never reported a length at all.
 async fn download_segment(
     client: reqwest::Client,
     url: String,
     range: Option<ByteRange>,
+    expected_len: Option<u64>,
     index: usize,
     segment_path: PathBuf,
     progress: mpsc::Sender<ProgressEvent>,
-) -> Result<PathBuf, EngineError> {
+) -> Result<(), EngineError> {
     let mut req = client.get(&url);
     if let Some(r) = range {
         req = req.header(reqwest::header::RANGE, r.header_value());
@@ -98,14 +108,18 @@ async fn download_segment(
     file.flush().await?;
     file.sync_all().await?;
 
-    if let Some(r) = range {
-        if downloaded != r.len() {
-            return Err(EngineError::Incomplete { index, expected: r.len(), got: downloaded });
+    // Applies to the unranged fallback as much as to a ranged segment: a connection
+    // that drops mid-transfer ends the stream cleanly from the client's point of
+    // view, so without this check a truncated download reports success and is
+    // merged into the destination as if it were whole.
+    if let Some(expected) = expected_len {
+        if downloaded != expected {
+            return Err(EngineError::Incomplete { index, expected, got: downloaded });
         }
     }
 
     let _ = progress.try_send(ProgressEvent::SegmentDone { index });
-    Ok(segment_path)
+    Ok(())
 }
 
 /// Downloads `url` to `dest` using up to `num_segments` parallel connections.
@@ -140,25 +154,39 @@ pub async fn download(
         _ => vec![None],
     };
 
+    let _ = progress
+        .send(ProgressEvent::Started {
+            total_bytes: total_len,
+            num_segments: ranges.len() as u64,
+        })
+        .await;
+
+    // Paths are built up front and owned here, not recovered from the tasks, so
+    // that cleanup on failure can reach every planned segment - including the one
+    // whose task failed, which is the likeliest to have left a partial file behind.
+    let mut segment_paths = Vec::with_capacity(ranges.len());
     let mut tasks = Vec::with_capacity(ranges.len());
     for (index, range) in ranges.into_iter().enumerate() {
         let segment_path = tmp_dir.join(format!("{file_name}.part{index}"));
+        segment_paths.push(segment_path.clone());
+        // A ranged segment owes exactly its range; the unranged fallback owes the
+        // whole resource, whenever the server told us how big that is.
+        let expected_len = range.map(|r| r.len()).or(total_len);
         tasks.push(tokio::spawn(download_segment(
             client.clone(), // Client is internally Arc'd already - no extra Arc needed
             url.to_string(),
             range,
+            expected_len,
             index,
             segment_path,
             progress.clone(),
         )));
     }
 
-    let mut segment_paths = Vec::with_capacity(tasks.len());
     let mut first_error: Option<EngineError> = None;
-
     for task in tasks {
         match task.await {
-            Ok(Ok(path)) => segment_paths.push(path),
+            Ok(Ok(())) => {}
             Ok(Err(e)) => { first_error.get_or_insert(e); }
             Err(join_err) => {
                 first_error.get_or_insert(EngineError::TaskFailed(join_err.to_string()));
@@ -169,8 +197,12 @@ pub async fn download(
     if let Some(err) = first_error {
         // Best-effort cleanup: don't let a failed unlink mask the real error.
         for path in &segment_paths {
-            if let Err(e) = tokio::fs::remove_file(path).await {
-                eprintln!("warning: failed to remove temp segment {path:?}: {e}");
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => {}
+                // Expected, not a problem: a segment that failed before creating
+                // its file - or never got scheduled - leaves nothing to remove.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!("warning: failed to remove temp segment {path:?}: {e}"),
             }
         }
         return Err(err);
@@ -273,9 +305,12 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let dest = dir.join(&file_name);
 
-        let (total_len, accepts_ranges) = probe(&reqwest::Client::new(), &url)
-            .await
-            .expect("probe failed");
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to build client");
+        let (total_len, accepts_ranges) = probe(&client, &url).await.expect("probe failed");
         println!("probe: content-length={total_len:?} accept-ranges={accepts_ranges}");
         println!("plan: {} segment(s) -> {}", if total_len.is_some() && accepts_ranges { segments.min(MAX_SEGMENTS) } else { 1 }, dest.display());
 
@@ -285,6 +320,9 @@ mod tests {
             let mut per_segment: HashMap<usize, u64> = HashMap::new();
             while let Some(event) = rx.recv().await {
                 match event {
+                    ProgressEvent::Started { total_bytes, num_segments } => {
+                        println!("  started: total_bytes={total_bytes:?} segments={num_segments}");
+                    }
                     ProgressEvent::SegmentProgress { index, bytes_downloaded } => {
                         per_segment.insert(index, bytes_downloaded);
                         let sum: u64 = per_segment.values().sum();
